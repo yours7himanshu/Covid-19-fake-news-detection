@@ -211,6 +211,14 @@ def health_check():
     """
     Health check endpoint
     """
+    # Lazy-load models if not loaded yet (native deploy under WSGI)
+    global model_loaded
+    if not model_loaded:
+        try:
+            logger.info("Health: attempting lazy model load...")
+            load_models()
+        except Exception as e:
+            logger.error(f"Health lazy load failed: {e}")
     return jsonify({
         "status": "healthy",
         "model_loaded": model_loaded,
@@ -223,6 +231,11 @@ def predict():
     Main prediction endpoint
     """
     try:
+        # Ensure models are loaded
+        global model_loaded
+        if not model_loaded:
+            logger.info("Predict: attempting lazy model load...")
+            load_models()
         # Get JSON data from request
         data = request.get_json()
         
