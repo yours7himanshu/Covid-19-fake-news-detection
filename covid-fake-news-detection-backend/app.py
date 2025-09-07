@@ -8,6 +8,7 @@ import os
 from datetime import datetime
 import logging
 from scipy.sparse import hstack
+from rule_filters import apply_rule_filters
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -73,12 +74,12 @@ def load_models():
     try:
         logger.info("Loading models...")
         
-        # Try to load ultimate models first
+        # Try to load enhanced models first (temporarily for testing)
         try:
-            ensemble_model = joblib.load('models/ultimate_ensemble_classifier.pkl')
-            char_vectorizer = joblib.load('models/ultimate_char_vectorizer.pkl')
-            word_vectorizer = joblib.load('models/ultimate_word_vectorizer.pkl')
-            logger.info("✅ Ultimate ensemble model loaded successfully!")
+            ensemble_model = joblib.load('models/enhanced_fake_news_classifier_passiveaggressive.pkl')
+            char_vectorizer = joblib.load('models/enhanced_tfidf_vectorizer.pkl')
+            word_vectorizer = None  # Enhanced model uses single vectorizer
+            logger.info("✅ Enhanced model loaded successfully!")
             model_loaded = True
             return True
             
@@ -144,16 +145,26 @@ def predict_news(text):
             elif hasattr(ensemble_model, 'decision_function'):
                 decision_score = ensemble_model.decision_function(combined_features)[0]
                 confidence = abs(decision_score)
-                fake_probability = 1 / (1 + np.exp(-decision_score))  # Sigmoid transformation
+                fake_probability = 1 / (1 + np.exp(-decision_score))
             else:
-                confidence = 1.0
-                fake_probability = 0.5
+                confidence = 0.7  # Default confidence for single model
+                fake_probability = 1.0 if prediction == 1 else 0.0
         except:
-            confidence = 1.0
-            fake_probability = 0.5
+            confidence = 0.7
+            fake_probability = 1.0 if prediction == 1 else 0.0
         
         # Interpret result
         label = "FAKE" if prediction == 1 else "REAL"
+        
+        # Apply rule-based filters to catch obvious cases the AI missed
+        filtered_label, filtered_confidence, filter_reason = apply_rule_filters(text, label, confidence)
+        
+        # If rule triggered, use filtered result
+        if filter_reason != "AI Model":
+            logger.info(f"Rule filter applied: {filter_reason}")
+            label = filtered_label
+            confidence = filtered_confidence
+            fake_probability = 1.0 if label == "FAKE" else 0.0
         
         return label, confidence, processed_text, fake_probability
         
@@ -233,7 +244,7 @@ def predict():
             "original_text": text,
             "processed_text": processed_text[:200] + "..." if len(processed_text) > 200 else processed_text,
             "timestamp": datetime.now().isoformat(),
-            "model_type": "Ultimate Ensemble" if word_vectorizer else "Enhanced" if "enhanced" in str(ensemble_model) else "Basic"
+            "model_type": "Hybrid AI + Rule-Based Model"
         }
         
         logger.info(f"Prediction made: {label} (confidence: {confidence:.3f})")
