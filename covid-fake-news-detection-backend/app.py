@@ -15,7 +15,20 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for React frontend
+# Explicit CORS for production (Vercel frontend, localhost dev)
+ALLOWED_ORIGINS = [
+    "https://covid-19-fake-news-detection.vercel.app",
+    "http://localhost:5173"
+]
+CORS(
+    app,
+    resources={r"/*": {"origins": ALLOWED_ORIGINS}},
+    supports_credentials=False,
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    max_age=86400,
+    always_send=True,
+)
 
 # Global variables for models
 ensemble_model = None
