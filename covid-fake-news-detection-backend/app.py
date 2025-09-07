@@ -8,6 +8,7 @@ import os
 from datetime import datetime
 import logging
 from scipy.sparse import hstack
+from pathlib import Path
 from rule_filters import apply_rule_filters
 
 # Set up logging
@@ -29,6 +30,10 @@ CORS(
     max_age=86400,
     always_send=True,
 )
+
+# Resolve paths relative to this file so it works on Render/containers
+BASE_DIR = Path(__file__).resolve().parent
+MODELS_DIR = BASE_DIR / "models"
 
 # Global variables for models
 ensemble_model = None
@@ -89,8 +94,8 @@ def load_models():
         
         # Try to load enhanced models first (temporarily for testing)
         try:
-            ensemble_model = joblib.load('models/enhanced_fake_news_classifier_passiveaggressive.pkl')
-            char_vectorizer = joblib.load('models/enhanced_tfidf_vectorizer.pkl')
+            ensemble_model = joblib.load(str(MODELS_DIR / 'enhanced_fake_news_classifier_passiveaggressive.pkl'))
+            char_vectorizer = joblib.load(str(MODELS_DIR / 'enhanced_tfidf_vectorizer.pkl'))
             word_vectorizer = None  # Enhanced model uses single vectorizer
             logger.info("✅ Enhanced model loaded successfully!")
             model_loaded = True
@@ -99,8 +104,8 @@ def load_models():
         except FileNotFoundError:
             # Fallback to enhanced model
             try:
-                ensemble_model = joblib.load('models/enhanced_fake_news_classifier_passiveaggressive.pkl')
-                char_vectorizer = joblib.load('models/enhanced_tfidf_vectorizer.pkl')
+                ensemble_model = joblib.load(str(MODELS_DIR / 'enhanced_fake_news_classifier_passiveaggressive.pkl'))
+                char_vectorizer = joblib.load(str(MODELS_DIR / 'enhanced_tfidf_vectorizer.pkl'))
                 word_vectorizer = None  # Enhanced model uses single vectorizer
                 logger.info("✅ Enhanced model loaded successfully!")
                 model_loaded = True
@@ -108,15 +113,19 @@ def load_models():
                 
             except FileNotFoundError:
                 # Fallback to basic model
-                ensemble_model = joblib.load('models/fake_news_classifier.pkl')
-                char_vectorizer = joblib.load('models/tfidf_vectorizer.pkl')
+                ensemble_model = joblib.load(str(MODELS_DIR / 'fake_news_classifier.pkl'))
+                char_vectorizer = joblib.load(str(MODELS_DIR / 'tfidf_vectorizer.pkl'))
                 word_vectorizer = None  # Basic model uses single vectorizer
                 logger.info("✅ Basic model loaded successfully!")
                 model_loaded = True
                 return True
                 
     except Exception as e:
-        logger.error(f"❌ Error loading models: {e}")
+        try:
+            models_listing = [p.name for p in MODELS_DIR.glob('*')]
+        except Exception:
+            models_listing = []
+        logger.error(f"❌ Error loading models: {e} | MODELS_DIR={MODELS_DIR} | contents={models_listing}")
         model_loaded = False
         return False
 
