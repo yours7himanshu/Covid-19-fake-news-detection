@@ -35,14 +35,6 @@ CORS(
 BASE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = BASE_DIR / "models"
 
-# Load models at import/startup (Flask 3.x removed before_first_request)
-try:
-    if not globals().get("model_loaded", False):
-        logger.info("Startup: loading models...")
-        load_models()
-except Exception as e:
-    logger.error(f"Startup load_models failed: {e}")
-
 # Global variables for models
 ensemble_model = None
 char_vectorizer = None
