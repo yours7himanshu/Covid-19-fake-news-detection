@@ -11,4 +11,6 @@ python-dotenv
 requests
 beautifulsoup4
 lxml
+pymongo
+dnspython
 
