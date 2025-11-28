@@ -451,7 +451,7 @@ def verify_fact():
             tools = [
                 {"google_search": {}}
             ]
-            # Try specific version tag 'gemini-1.5-flash-001' which is often more stable than the alias
+            # Try specific version tag 'gemini-flash-latest' which is the current stable version
             model = genai.GenerativeModel('gemini-flash-latest', tools=tools)
             
             # Prompt engineering for fact-checking
@@ -582,7 +582,7 @@ def fetch_latest_news():
         # 2. Analyze with Gemini
         genai.configure(api_key=api_key)
         # Use standard model without tools since we provide the data
-        model = genai.GenerativeModel('gemini-1.5-flash-001')
+        model = genai.GenerativeModel('gemini-flash-latest')
         
         prompt = f"""
         I have scraped the following latest COVID-19 news items. 
@@ -758,11 +758,10 @@ def dashboard_stats():
         logger.error(f"Dashboard stats error: {e}")
         return jsonify({"error": str(e)}), 500
 
+# Load models when the module is imported (for Gunicorn)
+load_models()
+
 if __name__ == '__main__':
-    # Load models on startup
-    if load_models():
-        logger.info("🚀 Starting COVID-19 Fake News Detection API...")
-        app.run(debug=True, host='0.0.0.0', port=5000)
-    else:
-        logger.error("❌ Failed to load models. Please check model files.")
-        print("❌ Cannot start API without models. Please ensure model files exist in 'models/' directory.")
+    # For local development
+    logger.info("🚀 Starting COVID-19 Fake News Detection API...")
+    app.run(debug=True, host='0.0.0.0', port=5000)
