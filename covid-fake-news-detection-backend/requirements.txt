@@ -13,4 +13,6 @@ beautifulsoup4
 lxml
 pymongo
 dnspython
+Pillow
+easyocr
 

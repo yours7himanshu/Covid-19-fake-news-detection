@@ -5,10 +5,13 @@ import numpy as np
 import pandas as pd
 import re
 import os
+import io
 from datetime import datetime
 import logging
 from scipy.sparse import hstack
 from pathlib import Path
+from urllib.parse import urlparse
+import json
 from rule_filters import apply_rule_filters
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -45,7 +48,11 @@ app = Flask(__name__)
 # Explicit CORS for production (Vercel frontend, localhost dev)
 ALLOWED_ORIGINS = [
     "https://covid-19-fake-news-detection.vercel.app",
-    "http://localhost:5173"
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173"
 ]
 CORS(
     app,
@@ -62,6 +69,95 @@ ensemble_model = None
 char_vectorizer = None
 word_vectorizer = None
 model_loaded = False
+easyocr_reader = None
+
+DEFAULT_MODALITY_WEIGHTS = {
+    "text": 0.5,
+    "image": 0.3,
+    "metadata": 0.2
+}
+
+# Model fallback order requested for quota resilience.
+GEMINI_MODEL_FALLBACKS = [
+    "gemini-3-flash",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-flash-latest",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-flash-001",
+]
+
+AVAILABLE_GEMINI_MODELS_CACHE = None
+
+def _normalize_model_name(model_name):
+    if not model_name:
+        return ""
+    return model_name.replace("models/", "").strip()
+
+def _get_available_generate_content_models():
+    """
+    Fetch and cache models that support generateContent for this API version.
+    """
+    global AVAILABLE_GEMINI_MODELS_CACHE
+    if AVAILABLE_GEMINI_MODELS_CACHE is not None:
+        return AVAILABLE_GEMINI_MODELS_CACHE
+
+    try:
+        discovered = set()
+        for model in genai.list_models():
+            methods = getattr(model, "supported_generation_methods", []) or []
+            if "generateContent" in methods:
+                discovered.add(_normalize_model_name(getattr(model, "name", "")))
+        AVAILABLE_GEMINI_MODELS_CACHE = discovered
+        logger.info(f"Discovered {len(discovered)} Gemini models supporting generateContent.")
+        return discovered
+    except Exception as e:
+        logger.warning(f"Could not list Gemini models; using static fallback list. Error: {e}")
+        AVAILABLE_GEMINI_MODELS_CACHE = set()
+        return AVAILABLE_GEMINI_MODELS_CACHE
+
+def generate_with_gemini_fallback(prompt, tools=None):
+    """
+    Generate content using Gemini with automatic model fallback:
+    gemini-3-flash -> gemini-2.5-flash -> gemini-2.0-flash.
+    """
+    models_to_try = GEMINI_MODEL_FALLBACKS.copy()
+    last_error = None
+
+    # Optional override via env, while preserving fallback defaults.
+    preferred_model = os.getenv("GEMINI_PRIMARY_MODEL", "").strip()
+    if preferred_model and preferred_model not in models_to_try:
+        models_to_try.insert(0, preferred_model)
+
+    available_models = _get_available_generate_content_models()
+    if available_models:
+        filtered = [m for m in models_to_try if _normalize_model_name(m) in available_models]
+        if filtered:
+            models_to_try = filtered
+        else:
+            logger.warning("No requested fallback models were found in available API models; trying static list anyway.")
+
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(model_name, tools=tools) if tools else genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            return response, model_name
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Gemini model {model_name} failed, trying next fallback. Error: {e}")
+
+            # If tools were enabled and failed, try same model once without tools.
+            if tools:
+                try:
+                    model = genai.GenerativeModel(model_name)
+                    response = model.generate_content(prompt)
+                    logger.warning(f"Gemini model {model_name} succeeded without tools after tool-mode failure.")
+                    return response, f"{model_name} (no-tools)"
+                except Exception as e_no_tools:
+                    last_error = e_no_tools
+                    logger.warning(f"Gemini model {model_name} without tools also failed: {e_no_tools}")
+
+    raise Exception(f"All Gemini fallback models failed. Last error: {last_error}")
 
 def preprocess_text(text):
     """
@@ -216,6 +312,278 @@ def predict_news(text):
         logger.error(f"❌ Prediction error: {e}")
         return None, 0.0, f"Prediction error: {e}", 0.5
 
+def normalize_confidence(raw_confidence):
+    """
+    Normalize model confidence to 0-1 range.
+    """
+    try:
+        confidence = float(raw_confidence)
+    except (TypeError, ValueError):
+        return 0.5
+
+    if confidence > 1.0:
+        # decision_function confidence can exceed 1
+        confidence = 1 / (1 + np.exp(-confidence))
+    return max(0.0, min(1.0, confidence))
+
+def score_text_modality(text):
+    """
+    Score text modality using existing ML pipeline.
+    """
+    if not text or len(text.strip()) < 10:
+        return {
+            "available": False,
+            "fake_risk": 0.5,
+            "confidence": 0.0,
+            "notes": ["Not enough text supplied for text model"]
+        }
+
+    label, confidence, _, fake_probability = predict_news(text)
+    if label is None:
+        return {
+            "available": False,
+            "fake_risk": 0.5,
+            "confidence": 0.0,
+            "notes": ["Text model failed to generate a prediction"]
+        }
+
+    return {
+        "available": True,
+        "prediction": label,
+        "fake_risk": float(fake_probability),
+        "confidence": normalize_confidence(confidence),
+        "notes": [f"Text model predicted {label}"]
+    }
+
+def extract_text_from_image_bytes(image_bytes):
+    """
+    Extract text from image using OCR, if OCR dependencies are available.
+    """
+    global easyocr_reader
+
+    if not image_bytes:
+        return "", "No image bytes provided"
+
+    try:
+        from PIL import Image, ImageOps, ImageEnhance, ImageFilter
+    except ImportError:
+        return "", "Pillow not installed (OCR unavailable)"
+
+    try:
+        import easyocr
+    except ImportError:
+        return "", "easyocr not installed (OCR unavailable)"
+
+    try:
+        if easyocr_reader is None:
+            # Keep OCR CPU-friendly for deployment environments.
+            easyocr_reader = easyocr.Reader(["en"], gpu=False)
+
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        # Upscale small images to improve OCR quality for screenshots/posts.
+        if image.width < 1200:
+            scale = max(1.5, 1200 / max(1, image.width))
+            image = image.resize(
+                (int(image.width * scale), int(image.height * scale)),
+                Image.Resampling.LANCZOS
+            )
+
+        gray = ImageOps.grayscale(image)
+        high_contrast = ImageOps.autocontrast(gray)
+        sharpened = high_contrast.filter(ImageFilter.SHARPEN)
+        boosted = ImageEnhance.Contrast(sharpened).enhance(1.8)
+        thresholded = boosted.point(lambda p: 255 if p > 150 else 0)
+
+        candidate_images = [image, gray, boosted, thresholded]
+
+        best_text = ""
+        best_score = 0
+
+        for candidate in candidate_images:
+            try:
+                result = easyocr_reader.readtext(np.array(candidate), detail=0, paragraph=True)
+                raw = " ".join(result) if result else ""
+            except Exception:
+                continue
+            cleaned = re.sub(r"\s+", " ", raw).strip()
+            # Score by alpha-numeric signal (more likely meaningful OCR text).
+            score = len(re.findall(r"[A-Za-z0-9]", cleaned))
+            if score > best_score:
+                best_score = score
+                best_text = cleaned
+
+        if best_text and best_score >= 12:
+            return best_text, "EasyOCR extracted text from enhanced image processing"
+        return "", "OCR found no readable text. Try a clearer image with larger visible text."
+    except Exception as e:
+        logger.warning(f"OCR failed: {e}")
+        return "", f"OCR failed: {str(e)}"
+
+def compute_visual_risk_from_image(image_bytes):
+    """
+    Lightweight visual signal from image structure (contrast and edge density).
+    """
+    if not image_bytes:
+        return 0.5, "No image provided for visual analysis"
+
+    try:
+        from PIL import Image
+    except ImportError:
+        return 0.5, "Pillow not installed (visual analysis unavailable)"
+
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("L")
+        gray = np.asarray(image, dtype=np.float32)
+        if gray.size == 0:
+            return 0.5, "Image decoding failed"
+
+        contrast_score = min(1.0, float(np.std(gray) / 64.0))
+        gx = np.abs(np.diff(gray, axis=1))
+        gy = np.abs(np.diff(gray, axis=0))
+        edge_density = float((np.mean(gx > 30) + np.mean(gy > 30)) / 2.0)
+        edge_score = min(1.0, edge_density * 3.0)
+
+        visual_risk = float((0.45 * contrast_score) + (0.55 * edge_score))
+        visual_risk = max(0.0, min(1.0, visual_risk))
+        return visual_risk, "Visual score from edge density and contrast"
+    except Exception as e:
+        logger.warning(f"Visual analysis failed: {e}")
+        return 0.5, f"Visual analysis failed: {str(e)}"
+
+def score_image_modality(image_bytes):
+    """
+    Score image modality using OCR + lightweight visual signal.
+    """
+    if not image_bytes:
+        return {
+            "available": False,
+            "fake_risk": 0.5,
+            "confidence": 0.0,
+            "ocr_text": "",
+            "notes": ["No image provided"]
+        }
+
+    ocr_text, ocr_note = extract_text_from_image_bytes(image_bytes)
+    visual_risk, visual_note = compute_visual_risk_from_image(image_bytes)
+    notes = [ocr_note, visual_note]
+
+    ocr_risk = None
+    ocr_confidence = 0.0
+    if ocr_text and len(ocr_text) >= 10:
+        text_score = score_text_modality(ocr_text)
+        if text_score["available"]:
+            ocr_risk = text_score["fake_risk"]
+            ocr_confidence = text_score["confidence"]
+            notes.extend(text_score.get("notes", []))
+
+    if ocr_risk is not None:
+        # Weight OCR higher because it captures semantic claim text from image.
+        fake_risk = (0.7 * ocr_risk) + (0.3 * visual_risk)
+        confidence = (0.7 * ocr_confidence) + 0.2
+    else:
+        fake_risk = visual_risk
+        confidence = 0.4
+        notes.append("Image OCR text unavailable; using visual-only signal")
+
+    return {
+        "available": True,
+        "fake_risk": float(max(0.0, min(1.0, fake_risk))),
+        "confidence": float(max(0.0, min(1.0, confidence))),
+        "ocr_text": ocr_text,
+        "notes": notes
+    }
+
+def score_metadata_modality(source_url, text):
+    """
+    Score metadata modality from URL/domain and language cues.
+    """
+    signals = []
+    risk = 0.35
+    available = False
+
+    if source_url:
+        available = True
+        try:
+            parsed = urlparse(source_url.strip())
+            domain = (parsed.netloc or "").lower()
+            path = (parsed.path or "").lower()
+            full = f"{domain}{path}"
+
+            if parsed.scheme != "https":
+                risk += 0.15
+                signals.append("Source URL is not HTTPS")
+
+            suspicious_terms = ["breaking", "shocking", "exclusive", "miracle", "cure", "truth", "secret"]
+            if any(term in full for term in suspicious_terms):
+                risk += 0.15
+                signals.append("URL contains clickbait-like keywords")
+
+            if domain.count(".") >= 3:
+                risk += 0.1
+                signals.append("URL has deep subdomain nesting")
+
+            if domain.count("-") >= 2 or sum(ch.isdigit() for ch in domain) >= 3:
+                risk += 0.1
+                signals.append("Domain contains unusual characters/digits")
+        except Exception as e:
+            logger.warning(f"Metadata URL parse failed: {e}")
+            signals.append("URL parsing failed")
+
+    if text and text.strip():
+        available = True
+        text_lower = text.lower()
+        if text.count("!") >= 3:
+            risk += 0.08
+            signals.append("Text uses excessive exclamation marks")
+
+        sensational_phrases = ["they don't want you to know", "hidden truth", "100% cure", "guaranteed cure"]
+        if any(phrase in text_lower for phrase in sensational_phrases):
+            risk += 0.15
+            signals.append("Text has sensational claim patterns")
+
+    if not available:
+        return {
+            "available": False,
+            "fake_risk": 0.5,
+            "confidence": 0.0,
+            "notes": ["No URL/text metadata supplied"]
+        }
+
+    if not signals:
+        signals.append("No strong metadata risk signals detected")
+
+    return {
+        "available": True,
+        "fake_risk": float(max(0.0, min(1.0, risk))),
+        "confidence": 0.55,
+        "notes": signals
+    }
+
+def fuse_modalities(modality_scores):
+    """
+    Weighted late-fusion across available modalities.
+    """
+    available_modalities = {
+        name: values for name, values in modality_scores.items()
+        if values.get("available")
+    }
+
+    if not available_modalities:
+        return 0.5, {}
+
+    active_weight_sum = sum(DEFAULT_MODALITY_WEIGHTS[name] for name in available_modalities)
+    normalized_weights = {
+        name: DEFAULT_MODALITY_WEIGHTS[name] / active_weight_sum
+        for name in available_modalities
+    }
+
+    fused_risk = 0.0
+    for name, values in available_modalities.items():
+        fused_risk += normalized_weights[name] * values["fake_risk"]
+
+    return float(max(0.0, min(1.0, fused_risk))), normalized_weights
+
 @app.route('/')
 def home():
     """
@@ -309,6 +677,113 @@ def predict():
         
     except Exception as e:
         logger.error(f"❌ API error: {e}")
+        return jsonify({
+            "error": f"Internal server error: {str(e)}"
+        }), 500
+
+@app.route('/predict_multimodal', methods=['POST'])
+def predict_multimodal():
+    """
+    Multimodal prediction endpoint: text + image + metadata URL.
+    """
+    try:
+        global model_loaded
+        if not model_loaded:
+            logger.info("Predict multimodal: attempting lazy model load...")
+            load_models()
+
+        text = (request.form.get('text') or "").strip()
+        source_url = (request.form.get('url') or "").strip()
+        image_file = request.files.get('image')
+
+        has_image = bool(image_file and image_file.filename)
+        if not text and not source_url and not has_image:
+            return jsonify({
+                "error": "Provide at least one input: text, image, or url."
+            }), 400
+
+        image_bytes = b""
+        if has_image:
+            image_bytes = image_file.read()
+            if not image_bytes:
+                return jsonify({"error": "Uploaded image is empty."}), 400
+
+        text_score = score_text_modality(text)
+        image_score = score_image_modality(image_bytes)
+        metadata_score = score_metadata_modality(source_url, text)
+
+        modality_scores = {
+            "text": text_score,
+            "image": image_score,
+            "metadata": metadata_score
+        }
+        fused_fake_risk, normalized_weights = fuse_modalities(modality_scores)
+
+        image_ocr_text = image_score.get("ocr_text", "")
+        image_is_covid_related = None
+        image_relevance_reason = "No image provided."
+        if has_image:
+            if image_ocr_text and len(image_ocr_text.strip()) >= 10:
+                image_is_covid_related = quick_covid_relevance_check(image_ocr_text)
+                if image_is_covid_related:
+                    image_relevance_reason = "Image OCR text appears related to COVID-19."
+                else:
+                    image_relevance_reason = "Image OCR text is not related to COVID-19."
+            else:
+                image_relevance_reason = "No readable text found in image OCR. Please upload a clearer image."
+
+        prediction = "FAKE" if fused_fake_risk >= 0.5 else "REAL"
+        confidence = min(1.0, 0.5 + abs(fused_fake_risk - 0.5))
+
+        if confidence >= 0.85:
+            confidence_level = "Very High"
+        elif confidence >= 0.7:
+            confidence_level = "High"
+        elif confidence >= 0.55:
+            confidence_level = "Medium"
+        else:
+            confidence_level = "Low"
+
+        response = {
+            "prediction": prediction,
+            "confidence": round(confidence, 3),
+            "confidence_level": confidence_level,
+            "fake_probability": round(fused_fake_risk * 100, 1),
+            "real_probability": round((1 - fused_fake_risk) * 100, 1),
+            "timestamp": datetime.now().isoformat(),
+            "model_type": "Multimodal Fusion (Text + OCR/Image + Metadata)",
+            "modality_scores": {
+                name: {
+                    "available": values.get("available", False),
+                    "fake_risk": round(values.get("fake_risk", 0.5), 3),
+                    "confidence": round(values.get("confidence", 0.0), 3),
+                    "weight": round(normalized_weights.get(name, 0.0), 3),
+                    "notes": values.get("notes", [])[:3]
+                }
+                for name, values in modality_scores.items()
+            },
+            "ocr_text_preview": (
+                image_score.get("ocr_text", "")[:300] + "..."
+                if len(image_score.get("ocr_text", "")) > 300
+                else image_score.get("ocr_text", "")
+            ),
+            "ocr_text_for_verification": image_ocr_text[:6000] if image_ocr_text else "",
+            "image_has_text": bool(image_ocr_text.strip()),
+            "image_is_covid_related": image_is_covid_related,
+            "image_relevance_reason": image_relevance_reason
+        }
+
+        logger.info(
+            f"Multimodal prediction: {prediction} | risk={fused_fake_risk:.3f} | "
+            f"active_weights={normalized_weights} | "
+            f"image_has_text={response['image_has_text']} | "
+            f"ocr_text_length={len(image_ocr_text)} | "
+            f"image_is_covid_related={response['image_is_covid_related']}"
+        )
+        return jsonify(response)
+
+    except Exception as e:
+        logger.error(f"❌ Multimodal API error: {e}")
         return jsonify({
             "error": f"Internal server error: {str(e)}"
         }), 500
@@ -423,111 +898,245 @@ def model_info():
     
     return jsonify(info)
 
+def extract_article_from_url(url):
+    """
+    Fetch and extract basic article content from a URL.
+    """
+    try:
+        parsed = urlparse(url.strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return {"ok": False, "error": "Invalid URL format"}
+
+        response = requests.get(
+            url,
+            timeout=12,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+        )
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        title = ""
+        if soup.title and soup.title.string:
+            title = soup.title.string.strip()
+
+        # Remove non-content tags.
+        for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside", "form"]):
+            tag.decompose()
+
+        text_chunks = [chunk.strip() for chunk in soup.stripped_strings if chunk and len(chunk.strip()) > 2]
+        article_text = " ".join(text_chunks)
+        article_text = re.sub(r"\s+", " ", article_text).strip()
+
+        if not article_text:
+            return {"ok": False, "error": "Could not extract article text from URL"}
+
+        return {
+            "ok": True,
+            "title": title,
+            "content": article_text[:15000]  # Keep payload bounded for model call
+        }
+    except Exception as e:
+        logger.warning(f"URL scraping failed for {url}: {e}")
+        return {"ok": False, "error": f"URL scraping failed: {str(e)}"}
+
+def quick_covid_relevance_check(text_blob):
+    """
+    Fast keyword-based COVID relevance check for fallback and pre-filter.
+    """
+    if not text_blob:
+        return False
+
+    text = text_blob.lower()
+    covid_terms = [
+        "covid", "covid-19", "coronavirus", "sars-cov-2", "pandemic",
+        "lockdown", "mask mandate", "vaccination", "vaccine", "booster",
+        "who", "cdc", "variant", "omicron", "quarantine"
+    ]
+    return any(term in text for term in covid_terms)
+
+def parse_gemini_json_response(response_text, default_payload):
+    """
+    Parse Gemini response robustly even with markdown fencing.
+    """
+    if not response_text:
+        return default_payload
+
+    payload = response_text.strip()
+    if payload.startswith("```json"):
+        payload = payload[7:]
+    if payload.endswith("```"):
+        payload = payload[:-3]
+    payload = payload.strip()
+
+    try:
+        return json.loads(payload)
+    except Exception:
+        return default_payload
+
 @app.route('/verify_fact', methods=['POST'])
 def verify_fact():
     """
-    Verify a claim using Google Gemini with Search Grounding
+    Verify text and/or URL content using Gemini.
+    If URL is provided, scrape it and validate COVID relevance first.
     """
     try:
-        data = request.get_json()
-        text = data.get('text')
-        
-        if not text:
-            return jsonify({"error": "No text provided"}), 400
+        data = request.get_json() or {}
+        text = (data.get('text') or "").strip()
+        source_url = (data.get('url') or "").strip()
+        extracted_title = ""
+        extracted_content = ""
+        scraped_ok = False
+        scrape_error = None
+
+        if not text and not source_url:
+            return jsonify({"error": "No text or url provided"}), 400
+
+        # If URL is provided, scrape and extract article content first.
+        if source_url:
+            scrape_result = extract_article_from_url(source_url)
+            scraped_ok = scrape_result.get("ok", False)
+            if scraped_ok:
+                extracted_title = scrape_result.get("title", "")
+                extracted_content = scrape_result.get("content", "")
+            else:
+                scrape_error = scrape_result.get("error", "Unable to scrape URL")
 
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            return jsonify({"error": "Gemini API key not configured on server"}), 503
+            logger.warning("Gemini API key not configured; returning graceful fallback.")
+            return jsonify({
+                "verdict": "Unverified",
+                "explanation": "Gemini API key is not configured on the server. Showing multimodal model output only.",
+                "sources": [],
+                "risk_level": "Unknown",
+                "service_status": "degraded",
+                "is_covid_related": None,
+                "url_checked": bool(source_url),
+                "error": "Gemini API key not configured on server"
+            }), 200
 
         # Configure Gemini
         genai.configure(api_key=api_key)
-        
-        response = None
-        last_error = None
 
-        # Attempt 1: Try Gemini 1.5 Flash with Search Grounding (Best for fact checking)
-        try:
-            # Updated tool definition for Google Search
-            tools = [
-                {"google_search": {}}
-            ]
-            # Try specific version tag 'gemini-flash-latest' which is the current stable version
-            model = genai.GenerativeModel('gemini-flash-latest', tools=tools)
-            
-            # Prompt engineering for fact-checking
-            prompt = f"""
-            You are an expert COVID-19 fact-checker. Your task is to verify the following claim.
-            
-            Claim: "{text}"
-            
-            Please provide a structured response in JSON format with the following fields:
-            1. "verdict": One of ["True", "False", "Misleading", "Unverified"]
-            2. "explanation": A concise 2-3 sentence explanation of why.
-            3. "sources": A list of 2-3 credible sources (URLs) if available.
-            4. "risk_level": One of ["High", "Medium", "Low"] regarding public health risk.
-            
-            Ensure the tone is objective and scientific. Return ONLY the JSON.
-            """
-            
-            response = model.generate_content(prompt)
-            
-        except Exception as e:
-            last_error = e
-            logger.warning(f"⚠️ Gemini 1.5 Flash failed: {e}. Falling back to Gemini Pro.")
-            
-            # Attempt 2: Fallback to Gemini Pro (Standard, no search tools but reliable)
-            try:
-                model = genai.GenerativeModel('gemini-flash-latest')
-                
-                # Modified prompt for model without search tools
-                prompt = f"""
-                You are an expert COVID-19 fact-checker. Your task is to verify the following claim based on your training data.
-                
-                Claim: "{text}"
-                
-                Please provide a structured response in JSON format with the following fields:
-                1. "verdict": One of ["True", "False", "Misleading", "Unverified"]
-                2. "explanation": A concise 2-3 sentence explanation of why.
-                3. "sources": A list of 2-3 credible sources (URLs) if you know them, otherwise empty list [].
-                4. "risk_level": One of ["High", "Medium", "Low"] regarding public health risk.
-                
-                Ensure the tone is objective and scientific. Return ONLY the JSON.
-                """
-                
-                response = model.generate_content(prompt)
-            except Exception as e2:
-                raise Exception(f"All models failed. Flash error: {last_error}. Pro error: {e2}")
+        # Determine verification content
+        content_for_check = text
+        if scraped_ok and extracted_content:
+            content_for_check = f"Title: {extracted_title}\n\nArticle Content:\n{extracted_content}"
 
-        # Parse the response
-        response_text = response.text.strip()
-        
-        # Clean up markdown code blocks if present
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
-            
-        import json
-        try:
-            fact_check = json.loads(response_text)
-        except json.JSONDecodeError:
-            fact_check = {
+        if not content_for_check:
+            return jsonify({
                 "verdict": "Unverified",
-                "explanation": response_text,
+                "explanation": scrape_error or "No verifiable content found.",
+                "sources": [],
+                "risk_level": "Unknown",
+                "is_covid_related": None,
+                "url_checked": bool(source_url)
+            }), 200
+
+        # COVID relevance gate when URL is used.
+        covid_related = quick_covid_relevance_check(content_for_check)
+        relevance_reason = "Detected COVID-related terms in content."
+
+        if source_url:
+            try:
+                relevance_prompt = f"""
+                You are checking whether an article is related to COVID-19 / coronavirus public-health topic.
+                Return ONLY JSON with:
+                {{
+                  "is_covid_related": true/false,
+                  "reason": "short reason"
+                }}
+
+                Article URL: {source_url}
+                Title: {extracted_title}
+                Article excerpt:
+                {extracted_content[:3500]}
+                """
+                relevance_response, relevance_model_used = generate_with_gemini_fallback(relevance_prompt)
+                relevance_json = parse_gemini_json_response(
+                    getattr(relevance_response, "text", ""),
+                    {
+                        "is_covid_related": covid_related,
+                        "reason": relevance_reason
+                    }
+                )
+                covid_related = bool(relevance_json.get("is_covid_related", covid_related))
+                relevance_reason = relevance_json.get("reason", relevance_reason)
+                logger.info(f"Gemini relevance model used: {relevance_model_used}")
+            except Exception as rel_err:
+                logger.warning(f"Gemini relevance check failed, using keyword fallback: {rel_err}")
+
+            if not covid_related:
+                non_covid_response = {
+                    "verdict": "Not Related",
+                    "explanation": "The provided URL does not appear to be related to COVID-19. Please enter a COVID-related article URL for verification.",
+                    "sources": [],
+                    "risk_level": "Low",
+                    "is_covid_related": False,
+                    "url_checked": True,
+                    "url": source_url,
+                    "relevance_reason": relevance_reason
+                }
+                return jsonify(non_covid_response), 200
+
+        # Main Gemini verification.
+        # Search grounding can be toggled by env to avoid SDK/tool incompatibility noise.
+        response = None
+        model_used = None
+        try:
+            enable_search_tools = os.getenv("ENABLE_GEMINI_SEARCH_TOOLS", "false").lower() == "true"
+            tools = [{"google_search": {}}] if enable_search_tools else None
+            prompt = f"""
+            You are an expert COVID-19 fact-checker. Verify the following COVID-related claim/content.
+
+            Content to verify:
+            {content_for_check[:6000]}
+
+            Return ONLY JSON with fields:
+            1. "verdict": one of ["True", "False", "Misleading", "Unverified"]
+            2. "explanation": concise 2-3 sentence explanation.
+            3. "sources": list of 2-4 credible source URLs.
+            4. "risk_level": one of ["High", "Medium", "Low"]
+            """
+            response, model_used = generate_with_gemini_fallback(prompt, tools=tools)
+        except Exception as e:
+            raise Exception(f"Gemini verification failed across fallback models: {e}")
+
+        fact_check = parse_gemini_json_response(
+            getattr(response, "text", ""),
+            {
+                "verdict": "Unverified",
+                "explanation": "Could not parse Gemini response.",
                 "sources": [],
                 "risk_level": "Unknown"
             }
+        )
+        fact_check["is_covid_related"] = True
+        fact_check["url_checked"] = bool(source_url)
+        fact_check["gemini_model_used"] = model_used
+        if source_url:
+            fact_check["url"] = source_url
+            fact_check["url_scraped"] = scraped_ok
+            if scrape_error:
+                fact_check["url_scrape_note"] = scrape_error
+            if extracted_title:
+                fact_check["article_title"] = extracted_title
         
         # Save to MongoDB if available
         if verification_logs is not None:
             try:
                 log_entry = {
-                    "text": text,
+                    "text": text or extracted_title or source_url,
                     "verdict": fact_check.get("verdict", "Unverified"),
                     "explanation": fact_check.get("explanation", ""),
                     "risk_level": fact_check.get("risk_level", "Unknown"),
                     "timestamp": datetime.utcnow(),
-                    "source": "user_query"
+                    "source": "user_query",
+                    "url": source_url if source_url else None,
+                    "is_covid_related": fact_check.get("is_covid_related")
                 }
                 verification_logs.insert_one(log_entry)
             except Exception as db_err:
@@ -537,7 +1146,15 @@ def verify_fact():
 
     except Exception as e:
         logger.error(f"❌ Gemini verification error: {e}")
-        return jsonify({"error": str(e)}), 500
+        fallback = {
+            "verdict": "Unverified",
+            "explanation": "verification service is temporarily unavailable. Falling back to multimodal model output.",
+            "sources": [],
+            "risk_level": "Unknown",
+            "service_status": "degraded",
+            "error": str(e)
+        }
+        return jsonify(fallback), 200
 
 @app.route('/fetch_latest_news', methods=['GET'])
 def fetch_latest_news():
@@ -582,8 +1199,6 @@ def fetch_latest_news():
         # 2. Analyze with Gemini
         genai.configure(api_key=api_key)
         # Use standard model without tools since we provide the data
-        model = genai.GenerativeModel('gemini-flash-latest')
-        
         prompt = f"""
         I have scraped the following latest COVID-19 news items. 
         
@@ -606,7 +1221,7 @@ def fetch_latest_news():
         """
         
         try:
-            response = model.generate_content(prompt)
+            response, model_used = generate_with_gemini_fallback(prompt)
             
             # Parse JSON from response
             response_text = response.text.strip()
@@ -618,7 +1233,7 @@ def fetch_latest_news():
             import json
             analyzed_news = json.loads(response_text)
             
-            return jsonify({"news": analyzed_news})
+            return jsonify({"news": analyzed_news, "gemini_model_used": model_used})
             
         except Exception as e:
             logger.error(f"Gemini analysis failed: {e}")
@@ -729,9 +1344,8 @@ def dashboard_stats():
             api_key = os.getenv("GEMINI_API_KEY")
             if api_key:
                 genai.configure(api_key=api_key)
-                model = genai.GenerativeModel('gemini-1.5-flash-001')
                 prompt = "List 5 current trending COVID-19 misinformation topics or general health rumors. Return ONLY a JSON array of strings. Example: [\"Topic 1\", \"Topic 2\"]"
-                response = model.generate_content(prompt)
+                response, _model_used = generate_with_gemini_fallback(prompt)
                 text = response.text.strip()
                 if text.startswith("```json"): text = text[7:]
                 if text.endswith("```"): text = text[:-3]

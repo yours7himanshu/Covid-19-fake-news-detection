@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Send, AlertTriangle, CheckCircle, RefreshCw, Brain, Shield, Zap, Activity, Search, ExternalLink, Newspaper, BarChart2 } from 'lucide-react'
+import { Send, AlertTriangle, CheckCircle, RefreshCw, Brain, Shield, Activity, Search, ExternalLink, Newspaper, BarChart2, Image as ImageIcon, Link as LinkIcon } from 'lucide-react'
 import axios from 'axios'
 import Dashboard from './Dashboard'
 
@@ -14,8 +14,16 @@ const FakeNewsDetector = () => {
   const [verifying, setVerifying] = useState(false)
   const [latestNews, setLatestNews] = useState([])
   const [loadingNews, setLoadingNews] = useState(false)
+  const [sourceUrl, setSourceUrl] = useState('')
+  const [imageFile, setImageFile] = useState(null)
 
   const API_BASE_URL = import.meta.env.VITE_BACKEND_URL;
+
+  const mapGeminiVerdictToPrediction = (verdict) => {
+    if (verdict === 'False' || verdict === 'Misleading') return { prediction: 'FAKE', confidence: 0.93 }
+    if (verdict === 'True') return { prediction: 'REAL', confidence: 0.93 }
+    return null
+  }
 
   // Check API status on component mount
   useEffect(() => {
@@ -32,19 +40,19 @@ const FakeNewsDetector = () => {
       } else {
         setApiStatus('error')
       }
-    } catch (err) {
+    } catch {
       setApiStatus('error')
     }
   }
 
   const analyzeText = async () => {
-    if (!text.trim()) {
-      setError('Please enter some text to analyze')
+    if (!text.trim() && !imageFile && !sourceUrl.trim()) {
+      setError('Please provide at least one input: text, image, or source URL')
       return
     }
 
-    if (text.trim().length < 10) {
-      setError('Please enter at least 10 characters for better analysis')
+    if (text.trim() && text.trim().length < 10 && !imageFile) {
+      setError('Please enter at least 10 text characters or upload an image')
       return
     }
 
@@ -54,38 +62,178 @@ const FakeNewsDetector = () => {
     setVerificationResult(null)
 
     try {
-      // TEMPORARY: Use Gemini for main analysis instead of local model
-      const response = await axios.post(`${API_BASE_URL}/verify_fact`, {
-        text: text.trim()
-      })
+      const formData = new FormData()
+      if (text.trim()) {
+        formData.append('text', text.trim())
+      }
+      if (sourceUrl.trim()) {
+        formData.append('url', sourceUrl.trim())
+      }
+      if (imageFile) {
+        formData.append('image', imageFile)
+      }
 
-      const data = response.data;
-      
-      if(data){
-        // Map Gemini verdict to the format expected by the UI
-        let prediction = 'REAL';
-        let confidence = 0.95; // Default high confidence for Gemini
+      const multimodalResponse = await axios.post(`${API_BASE_URL}/predict_multimodal`, formData)
+      const multimodalData = multimodalResponse.data
 
-        if (data.verdict === 'False' || data.verdict === 'Misleading') {
-          prediction = 'FAKE';
-        } else if (data.verdict === 'Unverified') {
-          confidence = 0.5;
+      if (multimodalData) {
+        let finalResult = multimodalData
+
+        const hasTypedText = !!text.trim()
+        const hasUrl = !!sourceUrl.trim()
+        const imageOnlyFlow = !!imageFile && !hasTypedText && !hasUrl
+
+        // Image-only relevance gate: reject non-COVID images before verification.
+        if (imageOnlyFlow && multimodalData.image_is_covid_related === false) {
+          setVerificationResult({
+            verdict: 'Not Related',
+            explanation: 'This image is not related to COVID-19 based on OCR analysis. Please provide a different COVID-related image.',
+            sources: [],
+            risk_level: 'Low',
+            is_covid_related: false,
+            input_type: 'image',
+            relevance_reason: multimodalData.image_relevance_reason
+          })
+          finalResult = {
+            ...multimodalData,
+            decision_source: 'Image Relevance Gate (Non-COVID)'
+          }
+        // Prioritize Gemini-verified verdict when text is available.
+        } else if (hasTypedText) {
+          try {
+            setVerifying(true)
+            const verifyResponse = await axios.post(`${API_BASE_URL}/verify_fact`, {
+              text: text.trim(),
+              url: sourceUrl.trim() || undefined
+            })
+            const geminiData = verifyResponse.data
+            setVerificationResult(geminiData)
+
+            const mapped = mapGeminiVerdictToPrediction(geminiData?.verdict)
+            if (mapped) {
+              finalResult = {
+                ...multimodalData,
+                prediction: mapped.prediction,
+                confidence: Math.max(multimodalData.confidence || 0, mapped.confidence),
+                confidence_level: 'Gemini Prioritized',
+                decision_source: 'Verified + Multimodal Support'
+              }
+            } else {
+              finalResult = {
+                ...multimodalData,
+                decision_source: 'Multimodal Model (Gemini Unverified)'
+              }
+            }
+          } catch {
+            setVerificationResult({
+              verdict: 'Unverified',
+              explanation: 'Verification cannot be confirmed',
+              sources: [],
+              risk_level: 'Unknown',
+              service_status: 'degraded'
+            })
+            finalResult = {
+              ...multimodalData,
+              decision_source: 'Multimodal Model (Gemini Unavailable)'
+            }
+          } finally {
+            setVerifying(false)
+          }
+        } else if (hasUrl) {
+          // If user only provides URL, still run external verification automatically.
+          try {
+            setVerifying(true)
+            const verifyResponse = await axios.post(`${API_BASE_URL}/verify_fact`, {
+              url: sourceUrl.trim()
+            })
+            const geminiData = verifyResponse.data
+            setVerificationResult(geminiData)
+            finalResult = {
+              ...multimodalData,
+              decision_source: geminiData?.is_covid_related === false
+                ? 'URL Relevance Gate (Non-COVID)'
+                : 'URL-based Verification + Multimodal Support'
+            }
+          } catch {
+            setVerificationResult({
+              verdict: 'Unverified',
+              explanation: 'URL verification is temporarily unavailable. Showing multimodal model result.',
+              sources: [],
+              risk_level: 'Unknown',
+              service_status: 'degraded'
+            })
+            finalResult = {
+              ...multimodalData,
+              decision_source: 'Multimodal Model (URL Verification Unavailable)'
+            }
+          } finally {
+            setVerifying(false)
+          }
+        } else if (imageOnlyFlow && multimodalData.ocr_text_for_verification) {
+          // Image-only verification path: OCR text -> Gemini verify with sources.
+          try {
+            setVerifying(true)
+            const verifyResponse = await axios.post(`${API_BASE_URL}/verify_fact`, {
+              text: multimodalData.ocr_text_for_verification
+            })
+            const geminiData = verifyResponse.data
+            setVerificationResult({
+              ...geminiData,
+              input_type: 'image'
+            })
+
+            const mapped = mapGeminiVerdictToPrediction(geminiData?.verdict)
+            if (mapped) {
+              finalResult = {
+                ...multimodalData,
+                prediction: mapped.prediction,
+                confidence: Math.max(multimodalData.confidence || 0, mapped.confidence),
+                confidence_level: 'Gemini Prioritized',
+                decision_source: 'Image OCR Verification + Multimodal Support'
+              }
+            } else {
+              finalResult = {
+                ...multimodalData,
+                decision_source: 'Image OCR Verification (Unverified)'
+              }
+            }
+          } catch {
+            setVerificationResult({
+              verdict: 'Unverified',
+              explanation: 'Image OCR verification is temporarily unavailable. Showing multimodal model result.',
+              sources: [],
+              risk_level: 'Unknown',
+              service_status: 'degraded',
+              input_type: 'image'
+            })
+            finalResult = {
+              ...multimodalData,
+              decision_source: 'Multimodal Model (Image Verification Unavailable)'
+            }
+          } finally {
+            setVerifying(false)
+          }
+        } else if (imageOnlyFlow) {
+          setVerificationResult({
+            verdict: 'Unverified',
+            explanation: multimodalData.image_relevance_reason || 'No readable text was found in the image. Please upload a clearer COVID-related image.',
+            sources: [],
+            risk_level: 'Unknown',
+            input_type: 'image'
+          })
+          finalResult = {
+            ...multimodalData,
+            decision_source: 'Image OCR Quality Check'
+          }
         }
 
-        setResult({
-          prediction,
-          confidence
-        });
-        
-        // Also set the verification result to show details immediately
-        setVerificationResult(data);
-      }
-      else {
-        setError('Data is not received from the server.')
+        setResult(finalResult)
+      } else {
+        setError('No data received from the server.')
       }
     } catch (err) {
-      setError(`Analysis failed: ${err.message}. Please ensure the backend is running.`);
-      console.log('Something went wrong',err);
+      setError(`Analysis failed: ${err.response?.data?.error || err.message}. Please ensure the backend is running.`)
+      console.log('Something went wrong', err)
     } finally {
       setLoading(false)
     }
@@ -98,17 +246,24 @@ const FakeNewsDetector = () => {
   }
 
   const verifyWithGemini = async () => {
-    if (!text.trim()) return
+    if (!text.trim() && !sourceUrl.trim()) return
     
     setVerifying(true)
     try {
       const response = await axios.post(`${API_BASE_URL}/verify_fact`, {
-        text: text.trim()
+        text: text.trim() || undefined,
+        url: sourceUrl.trim() || undefined
       })
       setVerificationResult(response.data)
     } catch (err) {
       console.error("Verification failed", err)
-      setError("Gemini verification failed. Please try again.")
+      setVerificationResult({
+        verdict: 'Unverified',
+        explanation: 'verification is temporarily unavailable. Try again in a few moments.',
+        sources: [],
+        risk_level: 'Unknown',
+        service_status: 'degraded'
+      })
     } finally {
       setVerifying(false)
     }
@@ -116,6 +271,8 @@ const FakeNewsDetector = () => {
 
   const clearAll = () => {
     setText('')
+    setSourceUrl('')
+    setImageFile(null)
     setResult(null)
     setError(null)
     setVerificationResult(null)
@@ -269,10 +426,48 @@ const FakeNewsDetector = () => {
                 {text.length} chars
               </div>
             </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+              <div>
+                <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">
+                  <span className="inline-flex items-center gap-2">
+                    <ImageIcon size={14} />
+                    Upload News Image (Optional)
+                  </span>
+                </label>
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) => setImageFile(e.target.files?.[0] || null)}
+                  className="w-full text-sm text-slate-600 file:mr-3 file:py-2 file:px-3 file:rounded-md file:border-0 file:bg-slate-100 file:text-slate-700 hover:file:bg-slate-200"
+                  disabled={apiStatus !== 'connected'}
+                />
+                {imageFile && (
+                  <p className="text-xs text-slate-500 mt-2">Selected: {imageFile.name}</p>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">
+                  <span className="inline-flex items-center gap-2">
+                    <LinkIcon size={14} />
+                    Source URL (Optional)
+                  </span>
+                </label>
+                <input
+                  type="url"
+                  value={sourceUrl}
+                  onChange={(e) => setSourceUrl(e.target.value)}
+                  placeholder="https://example.com/news-article"
+                  className="w-full p-3 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent text-sm"
+                  disabled={apiStatus !== 'connected'}
+                />
+              </div>
+            </div>
             
             <div className="flex flex-col sm:flex-row items-center justify-between mt-4 gap-4">
               <p className="text-xs text-slate-500 order-2 sm:order-1">
-                Press <kbd className="px-1.5 py-0.5 bg-slate-100 border border-slate-200 rounded text-slate-600 font-sans">Ctrl+Enter</kbd> to analyze
+                Add text, image, and source URL together for best multimodal results.
               </p>
               
               <div className="flex gap-3 w-full sm:w-auto order-1 sm:order-2">
@@ -286,7 +481,7 @@ const FakeNewsDetector = () => {
                 )}
                 <button
                   onClick={analyzeText}
-                  disabled={loading || apiStatus !== 'connected' || !text.trim() || text.trim().length < 10}
+                  disabled={loading || apiStatus !== 'connected' || (!text.trim() && !imageFile && !sourceUrl.trim())}
                   className="flex-1 sm:flex-none inline-flex justify-center items-center gap-2 px-6 py-2.5 bg-emerald-700 text-white rounded-lg hover:bg-emerald-800 disabled:bg-slate-300 disabled:cursor-not-allowed transition-all duration-200 shadow-sm font-medium text-sm"
                 >
                   {loading ? (
@@ -349,6 +544,11 @@ const FakeNewsDetector = () => {
                         : 'Content aligns with verified factual reporting patterns.'
                       }
                     </div>
+                    {result.decision_source && (
+                      <div className="text-xs text-slate-500 mt-2 font-medium">
+                        Decision Source: {result.decision_source}
+                      </div>
+                    )}
                   </div>
                   
                   <div className="w-full md:w-auto text-center md:text-right border-t md:border-t-0 md:border-l border-slate-100 pt-4 md:pt-0 md:pl-6 mt-2 md:mt-0">
@@ -377,6 +577,50 @@ const FakeNewsDetector = () => {
                 </div>
               </div>
 
+              {/* Modality Breakdown */}
+              {result.modality_scores && (
+                <div className="bg-white rounded-lg p-6 border border-slate-200 shadow-sm mb-6">
+                  <div className="flex justify-between items-center mb-4">
+                    <span className="font-semibold text-slate-700 text-sm">Multimodal Contributions</span>
+                    <span className="text-xs font-bold px-2 py-1 bg-emerald-50 rounded text-emerald-700 border border-emerald-100">
+                      {result.model_type || 'Multimodal Fusion'}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    {Object.entries(result.modality_scores)
+                      .filter(([modality, data]) => !(modality === 'image' && !data.available))
+                      .map(([modality, data]) => (
+                      <div key={modality} className="border border-slate-200 rounded-lg p-4 bg-slate-50">
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-xs font-bold uppercase tracking-wider text-slate-600">{modality}</span>
+                          <span className={`text-[10px] font-bold px-2 py-1 rounded ${
+                            data.available ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-500'
+                          }`}>
+                            {data.available ? 'ACTIVE' : 'N/A'}
+                          </span>
+                        </div>
+                        <p className="text-sm text-slate-700 mb-1">
+                          Risk: <span className="font-bold">{((data.fake_risk || 0) * 100).toFixed(1)}%</span>
+                        </p>
+                        <p className="text-sm text-slate-700 mb-3">
+                          Weight: <span className="font-bold">{((data.weight || 0) * 100).toFixed(0)}%</span>
+                        </p>
+                        {data.notes?.[0] && (
+                          <p className="text-xs text-slate-500 leading-relaxed">{data.notes[0]}</p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {result.ocr_text_preview && (
+                <div className="bg-white rounded-lg p-6 border border-slate-200 shadow-sm mb-6">
+                  <h4 className="font-bold text-slate-700 text-sm uppercase tracking-wide mb-2">OCR Extract (Image Text)</h4>
+                  <p className="text-sm text-slate-600 leading-relaxed">{result.ocr_text_preview}</p>
+                </div>
+              )}
+
               {/* Gemini Verification Section */}
               <div className="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
                 <div className="p-4 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
@@ -387,7 +631,7 @@ const FakeNewsDetector = () => {
                   {!verificationResult && (
                     <button
                       onClick={verifyWithGemini}
-                      disabled={verifying}
+                      disabled={verifying || (!text.trim() && !sourceUrl.trim())}
                       className="px-3 py-1.5 bg-slate-800 text-white text-xs font-medium rounded hover:bg-slate-700 transition-colors disabled:bg-slate-400 flex items-center gap-2"
                     >
                       {verifying ? 'Verifying...' : 'Cross-Check Sources'}
@@ -397,6 +641,13 @@ const FakeNewsDetector = () => {
 
                 {verificationResult && (
                   <div className="p-6">
+                    {verificationResult.is_covid_related === false && (
+                      <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-sm">
+                        {verificationResult.input_type === 'image'
+                          ? 'This image is not related to COVID-19. Please provide a different COVID-related image for verification.'
+                          : 'This URL is not related to COVID-19. Please provide a COVID-related article URL for verification.'}
+                      </div>
+                    )}
                     <div className="flex flex-col sm:flex-row items-start gap-4 mb-6">
                       <div className={`mt-1 p-1.5 rounded flex-shrink-0 ${
                         verificationResult.verdict === 'True' ? 'bg-emerald-100 text-emerald-700' :
